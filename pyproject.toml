@@ -6,4 +6,5 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "paddleocr[all]>=3.7.0",
+    "paddlepaddle>=3.3.1",
 ]
