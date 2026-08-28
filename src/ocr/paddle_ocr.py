@@ -65,7 +65,7 @@ def run_single_tier(img_files: list[Path], tier: str = "medium"):
     for idx, img_path in enumerate(img_files, 1):
         t0 = time.perf_counter()
         try:
-            result = ocr_model.predict(str(img_path))
+            result = ocr_model.predict(str(img_path), return_word_box=True)
             elapsed = time.perf_counter() - t0
 
             # 统计识别到的文本行数，并汇总所有文字（便于快速人工核对效果）
@@ -125,7 +125,7 @@ def main():
     img_files = get_images()
 
     all_summaries = []
-    summary = run_single_tier(img_files, tier="tiny")
+    summary = run_single_tier(img_files, tier="medium")
     all_summaries.append(summary)
 
     if len(all_summaries) > 1:

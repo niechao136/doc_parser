@@ -14,3 +14,6 @@ MODELS_DIR = ROOT_DIR / "models"
 
 
 OUT_DIR = ROOT_DIR / "output"
+
+
+FONT_DIR = ROOT_DIR / "fonts"
