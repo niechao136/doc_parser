@@ -26,8 +26,8 @@ CHECKBOX_GLYPHS = {"□", "○", "◯", "☐"}
 
 
 FIELD_DIR = OUT_DIR / "field"
-FIELD_PATH = FIELD_DIR / "field.json"
-OCR_RESULT_PATH = OUT_DIR / "medium" / "test_res.json"
+FIELD_PATH = FIELD_DIR / "field_116.json"
+OCR_RESULT_PATH = OUT_DIR / "ocr" / "ocr_result.json"
 
 
 s2t = opencc.OpenCC('s2t.json')
@@ -211,14 +211,18 @@ def flatten_ocr(ocr_data: dict) -> list[dict]:
     """把 OCR 结果整理成便于查找的结构：每一行的整体文本/坐标框，
     以及行内逐字符（token）的文本和坐标。"""
     lines = []
-    for i, text in enumerate(ocr_data["rec_texts"]):
+    ocrResults = ocr_data.get("ocrResults", [])
+    ocrResult = ocrResults[0] if ocrResults else {}
+    prunedResult = ocrResult.get("prunedResult", {})
+    rec_texts = ocr_data.get("rec_texts", prunedResult.get("rec_texts", []))
+    for i, text in enumerate(rec_texts):
         lines.append(
             {
                 "line_idx": i,
                 "text": text,
-                "box": ocr_data["rec_boxes"][i],  # [x0, y0, x1, y1]
-                "tokens": ocr_data["text_word"][i],
-                "token_boxes": ocr_data["text_word_boxes"][i],
+                "box": ocr_data.get("rec_boxes", prunedResult.get("rec_boxes", []))[i],  # [x0, y0, x1, y1]
+                "tokens": ocr_data.get("text_word", prunedResult.get("text_word", []))[i],
+                "token_boxes": ocr_data.get("text_word_boxes", prunedResult.get("text_word_boxes", []))[i],
             }
         )
     return lines
@@ -399,7 +403,7 @@ def compute_field_anchors(fields: list[dict], lines: list[dict]) -> list[float |
     """
     anchors = []
     for field in fields:
-        aliases = FIELD_LABEL_ALIASES.get(field["fieldKey"])
+        aliases = FIELD_LABEL_ALIASES.get(field["key"])
         found = find_label_position(
             field["label"], lines, min_ratio=0.6, aliases=aliases
         )
@@ -478,7 +482,7 @@ def extract_field_positions(fields_data: dict, ocr_data: dict) -> list[dict]:
         field_type = field["type"]
         label = field["label"]
         entry = {
-            "fieldKey": field["fieldKey"],
+            "key": field["key"],
             "label": label,
             "type": field_type,
         }
@@ -487,7 +491,7 @@ def extract_field_positions(fields_data: dict, ocr_data: dict) -> list[dict]:
             options = field.get("options") or []
             option_positions = {}
             search_window = get_field_search_window(
-                field["fieldKey"], window, lines
+                field["key"], window, lines
             )
             for opt in options:
                 pos = find_option_position(
@@ -502,7 +506,7 @@ def extract_field_positions(fields_data: dict, ocr_data: dict) -> list[dict]:
         else:
             if field_type == "Date":
                 date_positions = compute_date_field_positions(
-                    field["fieldKey"], label, lines
+                    field["key"], label, lines
                 )
                 if date_positions:
                     first_position = next(iter(date_positions.values()))
@@ -514,21 +518,21 @@ def extract_field_positions(fields_data: dict, ocr_data: dict) -> list[dict]:
                     entry["position"] = compute_text_field_position(
                         label,
                         lines,
-                        aliases=FIELD_LABEL_ALIASES.get(field["fieldKey"]),
-                        field_key=field["fieldKey"],
+                        aliases=FIELD_LABEL_ALIASES.get(field["key"]),
+                        field_key=field["key"],
                     )
             else:
                 entry["position"] = compute_inline_field_position(
-                    field["fieldKey"], lines
+                    field["key"], lines
                 ) or compute_text_field_position(
                     label,
                     lines,
-                    aliases=FIELD_LABEL_ALIASES.get(field["fieldKey"]),
-                    field_key=field["fieldKey"],
+                    aliases=FIELD_LABEL_ALIASES.get(field["key"]),
+                    field_key=field["key"],
                 )
 
                 overwrite_position = compute_default_value_overwrite_position(
-                    field["fieldKey"], label, lines
+                    field["key"], label, lines
                 )
                 if overwrite_position is not None:
                     entry["overwritePosition"] = overwrite_position
