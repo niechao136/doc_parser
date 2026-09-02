@@ -27,12 +27,12 @@ payload = {
     "returnWordBox": True,
     "useDocOrientationClassify": False,
     "useDocUnwarping": False,
-    "textDetThresh": 0.02,
-    "textDetBoxThresh": 0.01,
-    "textDetUnclipRatio": 1.5,
-    "textDetLimitType": "max",
-    "textDetLimitSideLen": 5000,
-    "textRecScoreThresh": 0.0,
+    # "textDetThresh": 0.02,
+    # "textDetBoxThresh": 0.01,
+    # "textDetUnclipRatio": 1.5,
+    # "textDetLimitType": "max",
+    # "textDetLimitSideLen": 5000,
+    # "textRecScoreThresh": 0.0,
 }
 
 response = requests.post(f"{BASE_URL}/ocr", json=payload)
