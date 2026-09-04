@@ -39,8 +39,9 @@ CHECKBOX_GLYPHS = {"□", "○", "◯", "☐"}
 DATE_CHAR_MARKERS = {"年", "月", "日"}
 
 FIELD_DIR = OUT_DIR / "field"
-FIELD_PATH = FIELD_DIR / "field_116.json"
+FIELD_PATH = FIELD_DIR / "field_full.json"
 OCR_RESULT_PATH = OUT_DIR / "ocr" / "ocr_result.json"
+OUT_PATH = FIELD_DIR / "out_full.json"
 
 TEXT_FIELD_GAP = 10  # 冒号右边留白
 GAP_ANOMALY_SEARCH_WINDOW = 6  # 异常间距只在 label 结束后这么多个 token 内搜索
@@ -74,6 +75,9 @@ OPTION_MATCH_CONFIDENCE = 0.85
 OPTION_MATCH_MIN_CONSIDER = 0.4
 OPTION_AMBIGUOUS_GAP = 0.08
 LABEL_AMBIGUOUS_GAP = 0.08
+ANCHOR_BOUNDARY_TOLERANCE_RATIO = 0.5
+ANCHOR_BOUNDARY_MIN_TOLERANCE = 2
+STRUCTURAL_INPUT_GAP_MIN_RATIO = 1.6
 OPTION_SECTION_GAP_TOLERANCE_RATIO = 0.25
 OPTION_SECTION_MIN_GAP_TOLERANCE = 2
 LEFT_INLINE_INPUT_OFFSET_RATIO = 0.45
@@ -88,7 +92,9 @@ _llm_client = ChatOpenAI(
     model=_LLM_MODEL,
     temperature=0,
     extra_body={
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {
+            "enable_thinking": False,
+        },
         "reasoning_effort": "none",
         "skip_reasoning": True,
         "skip_special_tokens": True,
@@ -182,6 +188,8 @@ class ValueRegionType(str, Enum):
     GLYPH_DATE_PART = "glyph_date_part"                  # 日期分段（斜杠 或 年/月/日 字符）
     GAP_ANOMALY = "gap_anomaly"                          # 无冒号无符号，但有明显异常宽的字间距
     INLINE_BEFORE_LABEL = "inline_before_label"          # 标签右侧有分隔符，输入区在标签左侧
+    STRUCTURAL_INPUT_GAP = "structural_input_gap"        # label 附近由异常间距形成的输入区
+    CHECKBOX_LABEL_TEXT = "checkbox_label_text"          # checkbox 在 label 左侧，文本输入区在 label 右侧
     GLYPH_MISSING_ESTIMATE = "glyph_missing_estimate"    # 以上锚点都没找到，靠 LLM/估算兜底
     OVERWRITE_REGION = "overwrite_region"                # 冒号后已有文字，需判断是否为待清除默认值
 
@@ -358,7 +366,15 @@ def _option_match_score(actual: str, target: str) -> float:
     return max(fuzzy_ratio(actual_without_controls, target), fuzzy_ratio(prefix, target))
 
 
-def _find_option_candidates(
+def _option_search_targets(option_text: str) -> tuple[str, ...]:
+    for separator in ("：", ":"):
+        prefix, found, suffix = option_text.partition(separator)
+        if found and normalize(prefix) and normalize(suffix):
+            return suffix, option_text
+    return (option_text,)
+
+
+def _find_option_candidates_for_target(
     option_text: str,
     lines: list[dict],
     top_k: int = MAX_CANDIDATES,
@@ -397,7 +413,7 @@ def _find_option_candidates(
                     candidate_key = (
                         score
                         + (0.2 if start > 0 and tokens[start - 1].strip() in CHECKBOX_GLYPHS else 0)
-                        + (0.2 if end == segment_end - 1 and len(candidate_text) >= len(target_n) else 0),
+                        + (0.2 if end == segment_end - 1 and candidate_text == target_n else 0),
                         -abs(len(candidate_text) - len(target_n)),
                         end == segment_end - 1 and len(candidate_text) >= len(target_n),
                         -end,
@@ -433,6 +449,31 @@ def _find_option_candidates(
         if len(deduped) >= top_k:
             break
     return deduped
+
+
+def _find_option_candidates(
+    option_text: str,
+    lines: list[dict],
+    top_k: int = MAX_CANDIDATES,
+    preferred_y: float | None = None,
+):
+    targets = _option_search_targets(option_text)
+    if len(targets) > 1:
+        suffix_candidates = _find_option_candidates_for_target(
+            targets[0], lines, top_k=top_k, preferred_y=preferred_y,
+        )
+        if any(candidate[0] >= OPTION_MATCH_MIN_CONSIDER for candidate in suffix_candidates):
+            return suffix_candidates
+    return _find_option_candidates_for_target(
+        option_text, lines, top_k=top_k, preferred_y=preferred_y,
+    )
+
+
+def _option_candidate_matches(option_text: str, candidate: tuple) -> bool:
+    candidate_text = normalize(
+        "".join(candidate[1]["tokens"][candidate[2] : candidate[3] + 1])
+    ).rstrip(":：,，、;；")
+    return any(candidate_text == normalize(target) for target in _option_search_targets(option_text))
 
 
 def flatten_ocr(ocr_data: dict) -> list[dict]:
@@ -1018,6 +1059,99 @@ def _find_post_label_separator(line: dict, end_idx: int) -> int | None:
     return None
 
 
+def _label_fragment_targets(label: str) -> tuple[str, ...]:
+    target = normalize(label)
+    if len(target) < 3:
+        return ()
+
+    fragments = set()
+    for split_idx in range(1, len(target)):
+        for fragment in (target[:split_idx], target[split_idx:]):
+            if 2 <= len(fragment) < len(target):
+                fragments.add(fragment)
+    return tuple(sorted(fragments, key=lambda fragment: (-len(fragment), fragment)))
+
+
+def _is_within_anchor_window(
+    candidate: tuple, previous_y: float, next_y: float,
+) -> bool:
+    line = candidate[1]
+    line_height = max(1, line["box"][3] - line["box"][1])
+    tolerance = max(
+        ANCHOR_BOUNDARY_MIN_TOLERANCE,
+        round(line_height * ANCHOR_BOUNDARY_TOLERANCE_RATIO),
+    )
+    candidate_y = line["box"][1]
+    return previous_y - tolerance <= candidate_y <= next_y + tolerance
+
+
+def _partial_candidate_is_compatible(
+    label: str, candidate: tuple, field_context: dict | str | None,
+) -> bool:
+    if not isinstance(field_context, dict):
+        return True
+
+    previous_y = field_context.get("previous_anchor_y")
+    if previous_y is None:
+        return True
+
+    line = candidate[1]
+    line_height = max(1, line["box"][3] - line["box"][1])
+    if abs(line["box"][1] - previous_y) > max(
+        ANCHOR_BOUNDARY_MIN_TOLERANCE,
+        round(line_height * ANCHOR_BOUNDARY_TOLERANCE_RATIO),
+    ):
+        return True
+
+    label_n = normalize(label)
+    for previous_field in field_context.get("previous_fields") or []:
+        previous_label = previous_field.get("label")
+        if not previous_label:
+            continue
+        previous_candidates = _find_top_candidates((previous_label,), [line], top_k=1)
+        if not previous_candidates or previous_candidates[0][0] < LABEL_MATCH_CONFIDENCE:
+            continue
+        if fuzzy_ratio(label_n, normalize(previous_label)) < LABEL_MATCH_MIN_CONSIDER:
+            return False
+    return True
+
+
+def _find_bounded_partial_label_candidates(
+    label: str, lines: list[dict], field_context: dict | str | None,
+) -> list[tuple] | None:
+    if not isinstance(field_context, dict):
+        return None
+
+    previous_y = field_context.get("previous_anchor_y")
+    next_y = field_context.get("next_anchor_y")
+    if previous_y is None or next_y is None or previous_y >= next_y:
+        return None
+
+    targets = _label_fragment_targets(label)
+    if not targets:
+        return None
+
+    candidates = _find_top_candidates(targets, lines, top_k=len(lines))
+    bounded = [
+        candidate
+        for candidate in candidates
+        if _is_within_anchor_window(candidate, previous_y, next_y)
+        and candidate[0] >= LABEL_MATCH_MIN_CONSIDER
+        and _partial_candidate_is_compatible(label, candidate, field_context)
+    ]
+    return bounded or None
+
+
+def _find_confident_label_hint(label: str, lines: list[dict]) -> float | None:
+    target_n = normalize(label)
+    candidates = _find_top_candidates((label,), lines, top_k=len(lines))
+    for score, line, start_idx, end_idx in candidates:
+        candidate_n = normalize("".join(line["tokens"][start_idx : end_idx + 1]))
+        if score >= LABEL_MATCH_CONFIDENCE and candidate_n == target_n:
+            return line["box"][1]
+    return None
+
+
 def _find_nearby_checkbox_reference(
     target_line: dict, target_x: int, lines: list[dict],
 ) -> dict | None:
@@ -1080,6 +1214,49 @@ def _find_glyph_immediately_before_label(line: dict, label_start_idx: int | None
     return {"x": box[0], "y": box[1], "width": box[2] - box[0], "height": box[3] - box[1]}
 
 
+def _find_structural_input_gap(
+    line: dict, label_start_idx: int | None, end_idx: int,
+) -> dict | None:
+    if label_start_idx is None or not line["token_boxes"]:
+        return None
+
+    line_height = max(1, line["box"][3] - line["box"][1])
+    stats = _typical_char_gap_stats(line)
+    search_start = max(1, label_start_idx + 1)
+    search_end = min(len(line["token_boxes"]), end_idx + 3)
+
+    for after_idx in range(search_start, search_end):
+        before_idx = after_idx - 1
+        previous_box = line["token_boxes"][before_idx]
+        next_box = line["token_boxes"][after_idx]
+        gap = next_box[0] - previous_box[2]
+        previous_width = previous_box[2] - previous_box[0]
+        next_width = next_box[2] - next_box[0]
+        if gap <= 0:
+            continue
+        if previous_width > line_height * 0.75 or next_width > line_height * 1.5:
+            continue
+        if gap < line_height * STRUCTURAL_INPUT_GAP_MIN_RATIO:
+            continue
+
+        if stats["median"] is not None:
+            mad = stats["mad"] or 1
+            strength = 0.6745 * (gap - stats["median"]) / mad
+        else:
+            strength = gap / line_height
+
+        return {
+            "before_idx": before_idx,
+            "after_idx": after_idx,
+            "x0": previous_box[2],
+            "x1": next_box[0],
+            "width": gap,
+            "strength": strength,
+            "sample_size": stats["sample_size"],
+        }
+    return None
+
+
 # ------------------------- 标签定位 -------------------------
 
 
@@ -1092,6 +1269,7 @@ def find_label_position(label: str, lines: list[dict], field_context: dict | str
         return None
 
     used_bounded = False
+    used_partial = False
     if isinstance(field_context, dict):
         previous_y = field_context.get("previous_anchor_y")
         next_y = field_context.get("next_anchor_y")
@@ -1101,21 +1279,29 @@ def find_label_position(label: str, lines: list[dict], field_context: dict | str
             bounded_exact = [
                 candidate
                 for candidate in expanded_candidates
-                if previous_y < candidate[1]["box"][1] < next_y
+                if _is_within_anchor_window(candidate, previous_y, next_y)
                 and normalize("".join(candidate[1]["tokens"][candidate[2] : candidate[3] + 1])) == target_n
             ]
             if bounded_exact:
                 candidates = bounded_exact
                 used_bounded = True
+            else:
+                bounded_partial = _find_bounded_partial_label_candidates(label, lines, field_context)
+                if bounded_partial:
+                    candidates = bounded_partial
+                    used_bounded = True
+                    used_partial = True
 
     top_score = candidates[0][0]
     if top_score < LABEL_MATCH_MIN_CONSIDER:
         return None
 
     ambiguous = len(candidates) > 1 and (top_score - candidates[1][0]) < LABEL_AMBIGUOUS_GAP
-    if top_score >= LABEL_MATCH_CONFIDENCE and not ambiguous:
+    if (top_score >= LABEL_MATCH_CONFIDENCE or used_partial) and not ambiguous:
         _, line, _, end = candidates[0]
-        method = "bounded_exact" if used_bounded else "fuzzy_exact"
+        method = "bounded_partial" if used_partial else (
+            "bounded_exact" if used_bounded else "fuzzy_exact"
+        )
         return line, end, method, top_score
 
     chosen = _llm_resolve_label(label, candidates, field_context)
@@ -1233,8 +1419,7 @@ def find_option_position(
         field_context = {"label": field_label}
 
     chosen_idx = 0
-    candidate_text = normalize("".join(candidates[0][1]["tokens"][candidates[0][2] : candidates[0][3] + 1]))
-    exact_match = candidate_text == normalize(option_text)
+    exact_match = _option_candidate_matches(option_text, candidates[0])
     ambiguous = len(candidates) > 1 and (candidates[0][0] - candidates[1][0]) < OPTION_AMBIGUOUS_GAP
     if top_score < OPTION_MATCH_CONFIDENCE or ambiguous or not exact_match:
         from_group = _llm_resolve_option_group([option_text], candidates, field_context, lines)
@@ -1341,7 +1526,7 @@ def _resolve_option_positions(
         exact = (
             len(candidates) == 1
             and candidates[0][0] >= OPTION_MATCH_CONFIDENCE
-            and normalize("".join(candidates[0][1]["tokens"][candidates[0][2] : candidates[0][3] + 1])) == normalize(option)
+            and _option_candidate_matches(option, candidates[0])
         )
         exact_flags.append(exact)
 
@@ -1423,6 +1608,12 @@ def _resolve_option_positions(
 
 
 # ------------------------- 非选择类栏位定位 -------------------------
+
+
+def compute_structural_input_gap_position(line: dict, gap: dict) -> dict:
+    input_x = gap["x0"]
+    y0, y1 = line["box"][1], line["box"][3]
+    return {"x": input_x, "y": y0, "height": y1 - y0}
 
 
 def compute_text_field_position(line: dict, end_idx: int) -> dict:
@@ -1575,12 +1766,23 @@ def classify_value_region(
             detected.append(ValueRegionType.GLYPH_BEFORE_LABEL)
         else:
             detected.append(ValueRegionType.GLYPH_MISSING_ESTIMATE)
-    elif (
-        field_type in ("Text", "Number")
-        and lines is not None
-        and _has_left_inline_input_signal(field["label"], line, end_idx, lines)
-    ):
-        detected.append(ValueRegionType.INLINE_BEFORE_LABEL)
+    elif field_type in ("Text", "Number"):
+        label_start_idx = _infer_label_start_idx(field["label"], line, end_idx)
+        if _find_structural_input_gap(line, label_start_idx, end_idx) is not None:
+            detected.append(ValueRegionType.STRUCTURAL_INPUT_GAP)
+        elif (
+            field_type == "Text"
+            and _find_glyph_immediately_before_label(line, label_start_idx) is not None
+        ):
+            detected.append(ValueRegionType.CHECKBOX_LABEL_TEXT)
+        elif lines is not None and _has_left_inline_input_signal(field["label"], line, end_idx, lines):
+            detected.append(ValueRegionType.INLINE_BEFORE_LABEL)
+        elif _find_colon_boundary(line, end_idx) is not None:
+            detected.append(ValueRegionType.COLON_ANCHORED)
+        elif _find_anomalous_gap_after_label(line, end_idx) is not None:
+            detected.append(ValueRegionType.GAP_ANOMALY)
+        else:
+            detected.append(ValueRegionType.GLYPH_MISSING_ESTIMATE)
     elif _find_colon_boundary(line, end_idx) is not None:
         detected.append(ValueRegionType.COLON_ANCHORED)
     elif _find_anomalous_gap_after_label(line, end_idx) is not None:
@@ -1604,6 +1806,21 @@ def _handle_inline_before_label(field, line, end_idx, lines, field_context) -> P
     if position is None:
         return PositionResult(None, Confidence.UNRESOLVED, "inline_before_label_unresolved", needs_review=True)
     return PositionResult(position, Confidence.LOW, "inline_before_label", needs_review=True)
+
+
+def _handle_structural_input_gap(field, line, end_idx, lines, field_context) -> PositionResult:
+    label_start_idx = _infer_label_start_idx(field["label"], line, end_idx)
+    gap = _find_structural_input_gap(line, label_start_idx, end_idx)
+    if gap is None:
+        return PositionResult(None, Confidence.UNRESOLVED, "structural_input_gap_missing", needs_review=True)
+
+    position = compute_structural_input_gap_position(line, gap)
+    return PositionResult(position, Confidence.HIGH, "structural_gap_left", needs_review=False)
+
+
+def _handle_checkbox_label_text(field, line, end_idx, lines, field_context) -> PositionResult:
+    position = compute_text_field_position(line, end_idx)
+    return PositionResult(position, Confidence.MEDIUM, "text_after_checkbox_label", needs_review=True)
 
 
 def _handle_glyph_before_label(field, line, end_idx, lines, field_context) -> PositionResult:
@@ -1690,6 +1907,8 @@ def _handle_overwrite_region(field, line, end_idx, lines, field_context) -> Posi
 TYPE_HANDLERS = {
     ValueRegionType.COLON_ANCHORED: _handle_colon_anchored,
     ValueRegionType.INLINE_BEFORE_LABEL: _handle_inline_before_label,
+    ValueRegionType.STRUCTURAL_INPUT_GAP: _handle_structural_input_gap,
+    ValueRegionType.CHECKBOX_LABEL_TEXT: _handle_checkbox_label_text,
     ValueRegionType.GLYPH_BEFORE_LABEL: _handle_glyph_before_label,
     ValueRegionType.GAP_ANOMALY: _handle_gap_anomaly,
     ValueRegionType.GLYPH_DATE_PART: _handle_glyph_date_part,
@@ -1740,8 +1959,7 @@ def compute_field_anchors(fields: list[dict], lines: list[dict]):
     matches = []
     anchor_hints = []
     for field in fields:
-        candidates = _find_top_candidates((field["label"],), lines, top_k=1)
-        anchor_hints.append(candidates[0][1]["box"][1] if candidates else None)
+        anchor_hints.append(_find_confident_label_hint(field["label"], lines))
 
     for field_index, field in enumerate(fields):
         context = _build_field_context(fields, field_index, anchor_hints=anchor_hints)
@@ -1845,7 +2063,7 @@ def main():
     positions = extract_field_positions(fields_data, ocr_data)
     print_summary()
 
-    out_path = FIELD_DIR / "llm_position.json"
+    out_path = OUT_PATH
     out_path.write_text(json.dumps(positions, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n写入 {out_path}，共 {len(positions)} 个栏位")
 
