@@ -266,6 +266,35 @@ class ExtractTests(unittest.TestCase):
             {"x": 567, "y": 34, "height": 18},
         )
 
+    def test_medical_record_colon_is_not_treated_as_same_line_split(self):
+        fields_data = json.loads(extract.FIELD_PATH.read_text(encoding="utf-8"))
+        ocr_data = json.loads(extract.OCR_RESULT_PATH.read_text(encoding="utf-8"))
+        fields = fields_data["fields"]
+        lines = extract.flatten_ocr(ocr_data)
+        field_index = next(
+            index for index, field in enumerate(fields)
+            if field["key"] == "medical_record_number"
+        )
+        anchor_hints = [
+            extract._find_confident_label_hint(field["label"], lines)
+            for field in fields
+        ]
+        context = extract._build_field_context(fields, field_index, anchor_hints=anchor_hints)
+        line, end_idx, *_ = extract.find_label_position(
+            fields[field_index]["label"], lines, field_context=context
+        )
+
+        self.assertEqual(
+            extract.classify_value_region(
+                fields[field_index], line, end_idx, lines, context
+            ),
+            [extract.ValueRegionType.COLON_ANCHORED],
+        )
+        self.assertEqual(
+            extract.compute_text_field_position(line, end_idx),
+            {"x": 567, "y": 34, "height": 18},
+        )
+
     def test_partial_label_uses_matching_row_inside_field_window(self):
         lines = [
             self.make_line(
@@ -380,7 +409,12 @@ class ExtractTests(unittest.TestCase):
     def test_full_tube_number_fields_use_structural_input_gap(self):
         fields_data = json.loads(extract.FIELD_PATH.read_text(encoding="utf-8"))
         ocr_data = json.loads(extract.OCR_RESULT_PATH.read_text(encoding="utf-8"))
+        fields = fields_data["fields"]
         lines = extract.flatten_ocr(ocr_data)
+        anchor_hints = [
+            extract._find_confident_label_hint(field["label"], lines)
+            for field in fields
+        ]
         expected = {
             "nasogastric_tube_number": (41, 477, 577),
             "urinary_catheter_number": (43, 477, 599),
@@ -388,8 +422,9 @@ class ExtractTests(unittest.TestCase):
 
         for key, (line_idx, expected_x, expected_y) in expected.items():
             with self.subTest(key=key):
-                field = next(item for item in fields_data["fields"] if item["key"] == key)
-                context = {"previous_anchor_y": 578, "next_anchor_y": 663}
+                field_index = next(index for index, field in enumerate(fields) if field["key"] == key)
+                field = fields[field_index]
+                context = extract._build_field_context(fields, field_index, anchor_hints=anchor_hints)
                 match = extract.find_label_position(field["label"], lines, field_context=context)
 
                 self.assertIsNotNone(match)
@@ -400,6 +435,41 @@ class ExtractTests(unittest.TestCase):
                     field, match[0], match[1], lines, context
                 )
                 self.assertEqual(result.position, {"x": expected_x, "y": expected_y, "height": 17})
+
+    def test_stoma_fields_use_separate_same_line_input_gaps(self):
+        fields_data = json.loads(extract.FIELD_PATH.read_text(encoding="utf-8"))
+        ocr_data = json.loads(extract.OCR_RESULT_PATH.read_text(encoding="utf-8"))
+        fields = fields_data["fields"]
+        lines = extract.flatten_ocr(ocr_data)
+        anchor_hints = [
+            extract._find_confident_label_hint(field["label"], lines)
+            for field in fields
+        ]
+        expected = {
+            "stoma_care_instruction": (
+                extract.ValueRegionType.INLINE_BEFORE_LABEL,
+                {"x": 421, "y": 618, "height": 20},
+            ),
+            "stoma_care_number": (
+                extract.ValueRegionType.STRUCTURAL_INPUT_GAP,
+                {"x": 524, "y": 618, "height": 20},
+            ),
+        }
+
+        for key, (expected_region, expected_position) in expected.items():
+            with self.subTest(key=key):
+                field_index = next(index for index, field in enumerate(fields) if field["key"] == key)
+                field = fields[field_index]
+                context = extract._build_field_context(fields, field_index, anchor_hints=anchor_hints)
+                match = extract.find_label_position(field["label"], lines, field_context=context)
+
+                self.assertIsNotNone(match)
+                region_types = extract.classify_value_region(field, match[0], match[1], lines, context)
+                self.assertEqual(region_types, [expected_region])
+                result = extract.TYPE_HANDLERS[expected_region](
+                    field, match[0], match[1], lines, context
+                )
+                self.assertEqual(result.position, expected_position)
 
 
 if __name__ == "__main__":

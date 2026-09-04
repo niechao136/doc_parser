@@ -1214,6 +1214,34 @@ def _find_glyph_immediately_before_label(line: dict, label_start_idx: int | None
     return {"x": box[0], "y": box[1], "width": box[2] - box[0], "height": box[3] - box[1]}
 
 
+def _has_same_line_following_field(
+    line: dict,
+    label_start_idx: int | None,
+    label_end_idx: int,
+    lines: list[dict] | None,
+    field_context: dict | None,
+) -> bool:
+    if label_start_idx is None or lines is None or not isinstance(field_context, dict):
+        return False
+
+    label_x = line["token_boxes"][label_start_idx][0]
+    if _find_nearby_checkbox_reference(line, label_x, lines) is None:
+        return False
+
+    next_fields = field_context.get("next_fields") or []
+    if not next_fields:
+        return False
+
+    next_label = next_fields[0].get("label")
+    if not next_label:
+        return False
+    candidates = _find_top_candidates((next_label,), [line], top_k=1)
+    if not candidates:
+        return False
+    score, _, next_start_idx, _ = candidates[0]
+    return score >= LABEL_MATCH_MIN_CONSIDER and next_start_idx >= label_end_idx
+
+
 def _find_structural_input_gap(
     line: dict, label_start_idx: int | None, end_idx: int,
 ) -> dict | None:
@@ -1768,7 +1796,9 @@ def classify_value_region(
             detected.append(ValueRegionType.GLYPH_MISSING_ESTIMATE)
     elif field_type in ("Text", "Number"):
         label_start_idx = _infer_label_start_idx(field["label"], line, end_idx)
-        if _find_structural_input_gap(line, label_start_idx, end_idx) is not None:
+        if _has_same_line_following_field(line, label_start_idx, end_idx, lines, field_context):
+            detected.append(ValueRegionType.INLINE_BEFORE_LABEL)
+        elif _find_structural_input_gap(line, label_start_idx, end_idx) is not None:
             detected.append(ValueRegionType.STRUCTURAL_INPUT_GAP)
         elif (
             field_type == "Text"
